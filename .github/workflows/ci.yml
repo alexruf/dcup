@@ -16,7 +16,7 @@ env:
 
 jobs:
   check:
-    name: Format & Clippy
+    name: Format & Check
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
