@@ -66,12 +66,3 @@ What happens:
 - If the local platform cannot be determined, or a platform-matching remote digest cannot be found, the image is treated as up-to-date to avoid accidental pulls.
 - Only services belonging to selected images are pulled and recreated; other services are left untouched.
 
-## Development
-
-- See development-guidelines.md for project philosophy and workflow.
-- Run tests: `cargo test`
-- Build: `cargo build` or `cargo build --release`
-
-## License
-
-No license has been specified in Cargo.toml yet.
