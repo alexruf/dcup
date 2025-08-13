@@ -178,7 +178,18 @@ fn detect_compose_driver() -> Result<ComposeDriver> {
 fn find_compose_files(root: PathBuf) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for entry in WalkDir::new(root).follow_links(false) {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                if let Some(ioe) = e.io_error() {
+                    if ioe.kind() == std::io::ErrorKind::PermissionDenied {
+                        continue;
+                    }
+                }
+                return Err(e.into());
+            }
+        };
+
         if entry.file_type().is_file() {
             let name = entry.file_name().to_string_lossy().to_lowercase();
             if name == "docker-compose.yml"
