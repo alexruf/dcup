@@ -254,26 +254,49 @@ fn detect_update_for_image(image: &str) -> Result<UpdateCheck> {
     if local_platform.is_none() {
         // Without knowing the platform, we can't reliably select a matching remote digest.
         // Avoid false positives.
+        eprintln!(
+            "Warning: could not determine local platform for {}, treating as up-to-date",
+            image
+        );
         return Ok(UpdateCheck::UpToDate);
     }
 
+    let platform = local_platform.unwrap();
     // 3) Get the remote config digest for the matching platform
-    let remote_config_digest =
-        match get_remote_platform_config_digest(image, &local_platform.clone().unwrap()) {
-            Ok(Some(d)) => d,
-            Ok(None) => {
-                // Could not determine a platform-matching digest -> avoid false positives
-                return Ok(UpdateCheck::UpToDate);
-            }
-            Err(e) => {
-                // Non-fatal: if the remote digest can't be determined, assume up to date
-                eprintln!(
-                    "Warning: could not determine remote digest for {}: {}",
-                    image, e
-                );
-                return Ok(UpdateCheck::UpToDate);
-            }
-        };
+    let remote_config_digest = match get_remote_platform_config_digest(image, &platform) {
+        Ok(Some(d)) => d,
+        Ok(None) => {
+            // Could not determine a platform-matching digest -> avoid false positives
+            eprintln!(
+                "Warning: no matching platform found in remote manifest for {} (expected: {}/{}{}) - treating as up-to-date",
+                image,
+                platform.0,
+                platform.1,
+                platform
+                    .2
+                    .as_ref()
+                    .map(|v| format!("/{}", v))
+                    .unwrap_or_default()
+            );
+            return Ok(UpdateCheck::UpToDate);
+        }
+        Err(e) => {
+            // Non-fatal: if the remote digest can't be determined, assume up to date
+            eprintln!(
+                "Warning: could not determine remote digest for {} (platform: {}/{}{}) - {}",
+                image,
+                platform.0,
+                platform.1,
+                platform
+                    .2
+                    .as_ref()
+                    .map(|v| format!("/{}", v))
+                    .unwrap_or_default(),
+                e
+            );
+            return Ok(UpdateCheck::UpToDate);
+        }
+    };
 
     // 4) Compare remote config digest (image ID) against local .Id
     if remote_config_digest == local_id {
@@ -521,15 +544,95 @@ fn parse_local_platform_from_formatted(text: &str) -> Option<(String, String, Op
     Some((os, arch, variant))
 }
 
-// Pick config.digest for the matching platform from verbose manifest
+/// Checks if two platforms match exactly for manifest selection.
+///
+/// Platform matching is strict to avoid selecting the wrong architecture
+/// from multi-arch manifests. All three components must align:
+///
+/// - OS must match exactly (e.g., "linux")
+/// - Architecture must match exactly (e.g., "amd64", "arm64", "arm")
+/// - Variant must match exactly: both None, or both Some with same value
+///
+/// # Examples
+///
+/// Matches:
+/// - `linux/amd64` matches `linux/amd64` ✓
+/// - `linux/arm/v7` matches `linux/arm/v7` ✓
+///
+/// Does NOT match:
+/// - `linux/amd64` vs `linux/arm64` (arch differs)
+/// - `linux/arm/v7` vs `linux/arm/v8` (variant differs)
+/// - `linux/arm64` vs `linux/arm64/v8` (variant mismatch)
+///
+/// # Arguments
+///
+/// * `local` - Local platform as (os, arch, optional variant)
+/// * `remote_os` - Remote manifest's OS string
+/// * `remote_arch` - Remote manifest's architecture string
+/// * `remote_variant` - Remote manifest's optional variant string
+///
+/// # Returns
+///
+/// `true` if platforms match exactly, `false` otherwise
+fn platforms_match(
+    local: &(String, String, Option<String>),
+    remote_os: &str,
+    remote_arch: &str,
+    remote_variant: Option<&str>,
+) -> bool {
+    let (local_os, local_arch, local_variant) = local;
+
+    // OS and architecture must match exactly
+    if local_os != remote_os || local_arch != remote_arch {
+        return false;
+    }
+
+    // Variant must match exactly: both None or both Some with same value
+    match (local_variant.as_deref(), remote_variant) {
+        (Some(lv), Some(rv)) => lv == rv,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// Selects the config digest for a platform from a verbose multi-arch manifest.
+///
+/// This function iterates through manifest entries and finds the one matching
+/// the local platform using strict matching rules. For multi-arch images like
+/// grafana/grafana that support amd64, arm64, and arm/v7, this ensures we
+/// select the correct architecture variant.
+///
+/// # Platform Matching Logic
+///
+/// Uses strict matching via `platforms_match()`:
+/// - OS must match exactly
+/// - Architecture must match exactly
+/// - Variant must match exactly (both present and equal, or both absent)
+///
+/// # Arguments
+///
+/// * `val` - Parsed JSON from `docker manifest inspect --verbose`
+/// * `platform` - Local platform tuple (os, arch, optional variant)
+///
+/// # Returns
+///
+/// * `Some(String)` - The sha256 config digest for the matching platform
+/// * `None` - If no matching platform found or manifest structure is unexpected
 fn pick_config_digest_from_verbose_manifest(
     val: &json::Value,
     platform: &(String, String, Option<String>),
 ) -> Option<String> {
     if let Some(arr) = val.get("manifests").and_then(|m| m.as_array()) {
-        let (los, larch, lvar) = platform;
         for m in arr {
-            let p = m.get("platform").and_then(|p| p.as_object());
+            // Platform can be directly under manifest or inside Descriptor (Grafana-style)
+            let p = m
+                .get("platform")
+                .and_then(|p| p.as_object())
+                .or_else(|| {
+                    m.get("Descriptor")
+                        .and_then(|d| d.get("platform"))
+                        .and_then(|p| p.as_object())
+                });
             let mos = p
                 .and_then(|p| p.get("os"))
                 .and_then(|v| v.as_str())
@@ -540,13 +643,7 @@ fn pick_config_digest_from_verbose_manifest(
                 .unwrap_or_default();
             let mvariant = p.and_then(|p| p.get("variant")).and_then(|v| v.as_str());
 
-            let variant_matches = match (lvar.as_deref(), mvariant) {
-                (Some(lv), Some(rv)) => lv == rv,
-                (None, _) => true,
-                (Some(_), None) => true,
-            };
-
-            if mos == los && march == larch && variant_matches {
+            if platforms_match(platform, mos, march, mvariant) {
                 if let Some(d) = m
                     .get("SchemaV2Manifest")
                     .and_then(|s| s.get("config"))
@@ -687,5 +784,210 @@ services:
         let plat = ("linux".into(), "arm64".into(), Some("v8".into()));
         let d = pick_config_digest_from_verbose_manifest(&manifest, &plat).unwrap();
         assert_eq!(d, "sha256:cfg-arm64v8");
+    }
+
+    #[test]
+    fn test_platforms_match_exact_variant() {
+        let local = (
+            "linux".to_string(),
+            "arm".to_string(),
+            Some("v7".to_string()),
+        );
+
+        // Should match: exact same platform
+        assert!(platforms_match(&local, "linux", "arm", Some("v7")));
+
+        // Should NOT match: different variant
+        assert!(!platforms_match(&local, "linux", "arm", Some("v8")));
+
+        // Should NOT match: no variant on remote
+        assert!(!platforms_match(&local, "linux", "arm", None));
+
+        // Should NOT match: different architecture
+        assert!(!platforms_match(&local, "linux", "arm64", Some("v7")));
+
+        // Should NOT match: different OS
+        assert!(!platforms_match(&local, "windows", "arm", Some("v7")));
+    }
+
+    #[test]
+    fn test_platforms_match_no_variant() {
+        let local = ("linux".to_string(), "amd64".to_string(), None);
+
+        // Should match: both have no variant
+        assert!(platforms_match(&local, "linux", "amd64", None));
+
+        // Should NOT match: remote has variant
+        assert!(!platforms_match(&local, "linux", "amd64", Some("v1")));
+
+        // Should NOT match: different architecture
+        assert!(!platforms_match(&local, "linux", "arm64", None));
+    }
+
+    #[test]
+    fn test_platforms_match_arm64_variants() {
+        // arm64 with v8 variant
+        let local_v8 = (
+            "linux".to_string(),
+            "arm64".to_string(),
+            Some("v8".to_string()),
+        );
+        assert!(platforms_match(&local_v8, "linux", "arm64", Some("v8")));
+        assert!(!platforms_match(&local_v8, "linux", "arm64", None));
+
+        // arm64 without variant
+        let local_no_v = ("linux".to_string(), "arm64".to_string(), None);
+        assert!(platforms_match(&local_no_v, "linux", "arm64", None));
+        assert!(!platforms_match(&local_no_v, "linux", "arm64", Some("v8")));
+    }
+
+    #[test]
+    fn test_pick_config_digest_multi_arch_strict_matching() {
+        // Simulate a multi-arch manifest like Grafana's
+        let manifest = json::json!({
+            "manifests": [
+                {
+                    "digest": "sha256:amd64-manifest",
+                    "platform": {"os": "linux", "architecture": "amd64"},
+                    "SchemaV2Manifest": {
+                        "config": { "digest": "sha256:amd64-config" }
+                    }
+                },
+                {
+                    "digest": "sha256:arm64-manifest",
+                    "platform": {"os": "linux", "architecture": "arm64"},
+                    "SchemaV2Manifest": {
+                        "config": { "digest": "sha256:arm64-config" }
+                    }
+                },
+                {
+                    "digest": "sha256:armv7-manifest",
+                    "platform": {"os": "linux", "architecture": "arm", "variant": "v7"},
+                    "SchemaV2Manifest": {
+                        "config": { "digest": "sha256:armv7-config" }
+                    }
+                }
+            ]
+        });
+
+        // Test 1: amd64 should only match amd64
+        let plat_amd64 = ("linux".into(), "amd64".into(), None);
+        let result = pick_config_digest_from_verbose_manifest(&manifest, &plat_amd64).unwrap();
+        assert_eq!(result, "sha256:amd64-config");
+
+        // Test 2: arm64 should only match arm64
+        let plat_arm64 = ("linux".into(), "arm64".into(), None);
+        let result = pick_config_digest_from_verbose_manifest(&manifest, &plat_arm64).unwrap();
+        assert_eq!(result, "sha256:arm64-config");
+
+        // Test 3: arm/v7 should only match arm/v7
+        let plat_armv7 = ("linux".into(), "arm".into(), Some("v7".into()));
+        let result = pick_config_digest_from_verbose_manifest(&manifest, &plat_armv7).unwrap();
+        assert_eq!(result, "sha256:armv7-config");
+
+        // Test 4: arm/v8 should NOT match arm/v7 (returns None)
+        let plat_armv8 = ("linux".into(), "arm".into(), Some("v8".into()));
+        let result = pick_config_digest_from_verbose_manifest(&manifest, &plat_armv8);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_pick_config_digest_variant_mismatch_prevention() {
+        // This test specifically checks the bug fix: local without variant
+        // should NOT match remote with variant
+        let manifest = json::json!({
+            "manifests": [
+                {
+                    "platform": {"os": "linux", "architecture": "arm64", "variant": "v8"},
+                    "SchemaV2Manifest": {
+                        "config": { "digest": "sha256:arm64v8-config" }
+                    }
+                }
+            ]
+        });
+
+        // Local arm64 without variant should NOT match remote arm64/v8
+        let plat_arm64_no_variant = ("linux".into(), "arm64".into(), None);
+        let result = pick_config_digest_from_verbose_manifest(&manifest, &plat_arm64_no_variant);
+        assert!(result.is_none(), "Should not match when variant differs");
+    }
+
+    #[test]
+    fn test_pick_config_digest_grafana_real_world_scenario() {
+        // Test with actual structure from grafana-manifest-inspect.txt
+        // This represents the exact bug scenario
+        let manifest = json::json!({
+            "manifests": [
+                {
+                    "Ref": "docker.io/grafana/grafana:latest@sha256:0b49ab65a230a86cfdedf76a0b376fb4836b65cab828e816718f5a05316b7045",
+                    "Descriptor": {
+                        "platform": {"architecture": "amd64", "os": "linux"}
+                    },
+                    "SchemaV2Manifest": {
+                        "config": {
+                            "digest": "sha256:b8554c97f999a6e9528f630a89765efad3a196d100ccb086105cb1f0cb692b87"
+                        }
+                    }
+                },
+                {
+                    "Descriptor": {
+                        "platform": {"architecture": "arm64", "os": "linux"}
+                    },
+                    "SchemaV2Manifest": {
+                        "config": {
+                            "digest": "sha256:510b2c58d4ee7386d8bb6202f65c6025e0db996be32d1d8c2347df17cd186c8a"
+                        }
+                    }
+                },
+                {
+                    "Descriptor": {
+                        "platform": {"architecture": "arm", "os": "linux", "variant": "v7"}
+                    },
+                    "SchemaV2Manifest": {
+                        "config": {
+                            "digest": "sha256:e378315ddce7b24cac8e45ceff7baf2288c28a7ce3a09b00dde1bd6563f02932"
+                        }
+                    }
+                }
+            ]
+        });
+
+        // Local platform: linux/amd64 (no variant)
+        let local_platform = ("linux".to_string(), "amd64".to_string(), None);
+
+        // Should select ONLY the amd64 config digest, not arm or arm/v7
+        let selected = pick_config_digest_from_verbose_manifest(&manifest, &local_platform);
+        assert_eq!(
+            selected,
+            Some(
+                "sha256:b8554c97f999a6e9528f630a89765efad3a196d100ccb086105cb1f0cb692b87"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_pick_config_digest_empty_manifests() {
+        let manifest = json::json!({"manifests": []});
+        let plat = ("linux".into(), "amd64".into(), None);
+        let result = pick_config_digest_from_verbose_manifest(&manifest, &plat);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_pick_config_digest_missing_platform_info() {
+        let manifest = json::json!({
+            "manifests": [
+                {
+                    // Missing platform field
+                    "SchemaV2Manifest": {
+                        "config": { "digest": "sha256:some-config" }
+                    }
+                }
+            ]
+        });
+        let plat = ("linux".into(), "amd64".into(), None);
+        let result = pick_config_digest_from_verbose_manifest(&manifest, &plat);
+        assert!(result.is_none());
     }
 }
