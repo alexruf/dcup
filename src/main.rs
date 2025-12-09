@@ -625,14 +625,11 @@ fn pick_config_digest_from_verbose_manifest(
     if let Some(arr) = val.get("manifests").and_then(|m| m.as_array()) {
         for m in arr {
             // Platform can be directly under manifest or inside Descriptor (Grafana-style)
-            let p = m
-                .get("platform")
-                .and_then(|p| p.as_object())
-                .or_else(|| {
-                    m.get("Descriptor")
-                        .and_then(|d| d.get("platform"))
-                        .and_then(|p| p.as_object())
-                });
+            let p = m.get("platform").and_then(|p| p.as_object()).or_else(|| {
+                m.get("Descriptor")
+                    .and_then(|d| d.get("platform"))
+                    .and_then(|p| p.as_object())
+            });
             let mos = p
                 .and_then(|p| p.get("os"))
                 .and_then(|v| v.as_str())
